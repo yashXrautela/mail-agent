@@ -1,0 +1,9 @@
+.venv/
+.env
+credentials.json
+token.json
+raw_emails.json
+summarized_emails.json
+__pycache__/
+*.py[cod]
+.vscode/
