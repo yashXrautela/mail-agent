@@ -15,7 +15,7 @@ from compose import generate_new_email
 
 GOOGLE_CLIENT_SECRETS = "credentials.json"
 
-GOOGLE_REDIRECT_URI = "https://mail-agent-k3sk.onrender.com/auth/google/callback"
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify"
@@ -74,6 +74,7 @@ async def google_login(request: Request):
     )
 
     request.session["oauth_state"] = state
+    request.session["code_verifier"] = flow.code_verifier
 
     return RedirectResponse(authorization_url)
 
@@ -81,6 +82,7 @@ async def google_login(request: Request):
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
     state = request.session.get("oauth_state")
+    code_verifier = request.session.get("code_verifier")
 
     if not state:
         raise HTTPException(
@@ -88,11 +90,18 @@ async def google_callback(request: Request):
             detail="OAuth state missing"
         )
 
+    if not code_verifier:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth code verifier missing"
+        )
+
     flow = Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRETS,
         scopes=GOOGLE_SCOPES,
         state=state,
-        redirect_uri=GOOGLE_REDIRECT_URI
+        redirect_uri=GOOGLE_REDIRECT_URI,
+        code_verifier=code_verifier
     )
 
     flow.fetch_token(
@@ -105,6 +114,7 @@ async def google_callback(request: Request):
         token.write(credentials.to_json())
 
     request.session.pop("oauth_state", None)
+    request.session.pop("code_verifier", None)
 
     return {
         "message": "Google account connected successfully!"
