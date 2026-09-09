@@ -4,7 +4,7 @@ import requests
 import html
 from datetime import timedelta
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = "https://mail-agent-k3sk.onrender.com"
 
 # ---------- Page setup ----------
 st.set_page_config(
