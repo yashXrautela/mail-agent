@@ -15,7 +15,7 @@ from compose import generate_new_email
 
 GOOGLE_CLIENT_SECRETS = "credentials.json"
 
-GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+GOOGLE_REDIRECT_URI = "https://mail-agent-k3sk.onrender.com/auth/google/callback"
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify"
