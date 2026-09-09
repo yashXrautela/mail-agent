@@ -1,216 +1,307 @@
+import hashlib
 import json
 import os
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+import secrets
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from datetime import datetime, timedelta, timezone
+
+import psycopg
+from cryptography.fernet import Fernet
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from starlette.middleware.sessions import SessionMiddleware
+from google.auth.transport.requests import Request as GoogleRequest
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from pydantic import BaseModel
-from raw_mail import retrieve_emails  # Your Gmail fetcher
-from llm import summarize_with_llm    # Your summarizer
-from send_email import send_email     # Your sender
-from response import generate_response  
+from starlette.middleware.sessions import SessionMiddleware
+
 from compose import generate_new_email
+from llm import summarize_with_llm
+from raw_mail import retrieve_emails
+from response import generate_response
+from send_email import send_email
 
 GOOGLE_CLIENT_SECRETS = "credentials.json"
-
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
+DATABASE_URL = os.getenv("DATABASE_URL")
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+FERNET_KEY = os.getenv("OAUTH_ENCRYPTION_KEY")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify"
-]
+if not GOOGLE_REDIRECT_URI:
+    raise RuntimeError("GOOGLE_REDIRECT_URI is required")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required")
+if not SESSION_SECRET:
+    raise RuntimeError("SESSION_SECRET is required")
+if not FERNET_KEY:
+    raise RuntimeError("OAUTH_ENCRYPTION_KEY is required")
+
+cipher = Fernet(FERNET_KEY.encode())
 
 
-# In-memory cache and API usage tracking
-email_cache = {}
-api_usage = {
-    "total_calls": 0,
-    "summarize_calls": 0,
-    "response_calls": 0,
-    "last_reset": None
-}
+def db():
+    return psycopg.connect(DATABASE_URL)
 
-def track_api_call(call_type: str):
-    """Track an API call"""
-    global api_usage
-    api_usage["total_calls"] += 1
-    if call_type in api_usage:
-        api_usage[call_type] += 1
+
+def hash_token(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def init_database():
+    with db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                google_account_id TEXT UNIQUE NOT NULL,
+                credentials_encrypted TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS oauth_login_tickets (
+                ticket_hash TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS email_cache (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                emails JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Runs when the FastAPI app starts and shuts down.
-    Gmail access happens only after the user authenticates.
-    """
-    print("📩 Mail Agent API started")
-
+    init_database()
     yield
-
-    email_cache.clear()
-    print("🧹 Cleared email cache on shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     SessionMiddleware,
-    secret_key="change-this-later"
+    secret_key=SESSION_SECRET,
+    same_site="lax",
+    https_only=os.getenv("COOKIE_SECURE", "true").lower() == "true",
 )
+
+
+def encrypted_credentials(credentials: Credentials) -> str:
+    return cipher.encrypt(credentials.to_json().encode()).decode()
+
+
+def load_credentials(user_id: int) -> Credentials:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT credentials_encrypted FROM users WHERE id = %s", (user_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Google account is not connected")
+
+    data = json.loads(cipher.decrypt(row[0].encode()).decode())
+    credentials = Credentials.from_authorized_user_info(data, GOOGLE_SCOPES)
+    if credentials.expired:
+        if not credentials.refresh_token:
+            raise HTTPException(status_code=401, detail="Google authorization expired")
+        credentials.refresh(GoogleRequest())
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET credentials_encrypted = %s, updated_at = NOW() WHERE id = %s",
+                (encrypted_credentials(credentials), user_id),
+            )
+    return credentials
+
+
+def current_user(request: Request) -> int:
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    token_hash = hash_token(header[7:].strip())
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT user_id FROM app_sessions
+            WHERE token_hash = %s AND expires_at > NOW()
+            """,
+            (token_hash,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return row[0]
+
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_sessions (token_hash, user_id, expires_at)
+            VALUES (%s, %s, %s)
+            """,
+            (hash_token(token), user_id, datetime.now(timezone.utc) + timedelta(seconds=SESSION_TTL_SECONDS)),
+        )
+    return token
+
 
 @app.get("/auth/google")
 async def google_login(request: Request):
     flow = Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRETS,
         scopes=GOOGLE_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI
+        redirect_uri=GOOGLE_REDIRECT_URI,
     )
-
     authorization_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent"
+        access_type="offline", include_granted_scopes="true", prompt="consent"
     )
-
     request.session["oauth_state"] = state
     request.session["code_verifier"] = flow.code_verifier
-
     return RedirectResponse(authorization_url)
 
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
-    state = request.session.get("oauth_state")
-    code_verifier = request.session.get("code_verifier")
-
-    if not state:
-        raise HTTPException(
-            status_code=400,
-            detail="OAuth state missing"
-        )
-
-    if not code_verifier:
-        raise HTTPException(
-            status_code=400,
-            detail="OAuth code verifier missing"
-        )
+    state = request.session.pop("oauth_state", None)
+    code_verifier = request.session.pop("code_verifier", None)
+    if not state or not code_verifier:
+        raise HTTPException(status_code=400, detail="OAuth session is missing or expired")
 
     flow = Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRETS,
         scopes=GOOGLE_SCOPES,
         state=state,
         redirect_uri=GOOGLE_REDIRECT_URI,
-        code_verifier=code_verifier
+        code_verifier=code_verifier,
     )
-
-    flow.fetch_token(
-        authorization_response=str(request.url)
-    )
-
+    flow.fetch_token(authorization_response=str(request.url))
     credentials = flow.credentials
+    service = build("gmail", "v1", credentials=credentials)
+    profile = service.users().getProfile(userId="me").execute()
+    google_account_id = profile.get("emailAddress")
+    if not google_account_id:
+        raise HTTPException(status_code=400, detail="Google account identity unavailable")
+    google_account_id = google_account_id.lower()
 
-    with open("token.json", "w", encoding="utf-8") as token:
-        token.write(credentials.to_json())
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT credentials_encrypted FROM users WHERE google_account_id = %s",
+            (google_account_id,),
+        ).fetchone()
+        if not credentials.refresh_token and existing:
+            previous = json.loads(cipher.decrypt(existing[0].encode()).decode())
+            credentials.refresh_token = previous.get("refresh_token")
+        row = conn.execute(
+            """
+            INSERT INTO users (google_account_id, credentials_encrypted)
+            VALUES (%s, %s)
+            ON CONFLICT (google_account_id) DO UPDATE SET
+                credentials_encrypted = EXCLUDED.credentials_encrypted,
+                updated_at = NOW()
+            RETURNING id
+            """,
+            (google_account_id, encrypted_credentials(credentials)),
+        ).fetchone()
+        ticket = secrets.token_urlsafe(32)
+        conn.execute(
+            """
+            INSERT INTO oauth_login_tickets (ticket_hash, user_id, expires_at)
+            VALUES (%s, %s, NOW() + INTERVAL '2 minutes')
+            """,
+            (hash_token(ticket), row[0]),
+        )
+    return RedirectResponse(f"{FRONTEND_URL}?oauth_ticket={ticket}")
 
-    request.session.pop("oauth_state", None)
-    request.session.pop("code_verifier", None)
 
-    return {
-        "message": "Google account connected successfully!"
-    }
+@app.post("/auth/exchange")
+async def exchange_ticket(request: Request):
+    payload = await request.json()
+    ticket = payload.get("ticket", "")
+    if not ticket:
+        raise HTTPException(status_code=400, detail="OAuth ticket is required")
+    with db() as conn:
+        row = conn.execute(
+            """
+            DELETE FROM oauth_login_tickets
+            WHERE ticket_hash = %s AND expires_at > NOW()
+            RETURNING user_id
+            """,
+            (hash_token(ticket),),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid or expired OAuth ticket")
+    return {"session_token": create_session(row[0])}
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        with db() as conn:
+            conn.execute("DELETE FROM app_sessions WHERE token_hash = %s", (hash_token(header[7:].strip()),))
+    return {"status": "logged out"}
 
 
 @app.post("/refresh")
-async def refresh_emails():
-    """Force refresh emails from Gmail and resummarize."""
-    try:
-        print("📩 Fetching new emails from Gmail...")
-        retrieve_emails()
+async def refresh_emails(user_id: int = Depends(current_user)):
+    credentials = load_credentials(user_id)
+    raw_emails = retrieve_emails(credentials)
+    summarized = [
+        {
+            **email,
+            "summary": summarize_with_llm(email.get("body", "")),
+        }
+        for email in raw_emails
+    ]
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO email_cache (user_id, emails) VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET emails = EXCLUDED.emails, updated_at = NOW()
+            """,
+            (user_id, json.dumps(summarized)),
+        )
+    return {"status": "success", "count": len(summarized)}
 
-        if not os.path.exists("raw_emails.json"):
-            raise HTTPException(status_code=500, detail="No emails found after fetching")
 
-        with open("raw_emails.json", "r", encoding="utf-8") as f:
-            emails = json.load(f)
+def cached_emails(user_id: int):
+    with db() as conn:
+        row = conn.execute("SELECT emails FROM email_cache WHERE user_id = %s", (user_id,)).fetchone()
+    return row[0] if row else []
 
-        summarized = []
-        print("📝 Summarizing new emails...")
-        for email in emails:
-            body = email.get("body", "")
-            summary = summarize_with_llm(body)
-            summarized.append({
-                "id": email.get("id"),
-                "from": email.get("from"),
-                "subject": email.get("subject"),
-                "body": body,
-                "summary": summary
-            })
-
-        # Update cache and file
-        email_cache["summarized"] = summarized
-        with open("summarized_emails.json", "w", encoding="utf-8") as f:
-            json.dump(summarized, f, indent=4, ensure_ascii=False)
-        
-        print(f"✅ Summarized {len(summarized)} emails and saved to summarized_emails.json")
-        return {"status": "success", "count": len(summarized)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/emails")
-def get_emails():
-    """Returns summarized emails."""
-    if "summarized" not in email_cache:
-        if not os.path.exists("summarized_emails.json"):
-            return {"error": "No summarized emails found."}
-        with open("summarized_emails.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    return email_cache["summarized"]
+def get_emails(user_id: int = Depends(current_user)):
+    return cached_emails(user_id)
 
 
 @app.get("/emails/{email_id}")
-def get_email(email_id: str):
-    """Return a single email by ID."""
-    emails = email_cache.get("summarized", [])
-    for email in emails:
-        if email["id"] == email_id:
-            return email
-    raise HTTPException(status_code=404, detail="Email not found")
+def get_email(email_id: str, user_id: int = Depends(current_user)):
+    email = next((item for item in cached_emails(user_id) if item["id"] == email_id), None)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return email
 
 
 class ResponseRequest(BaseModel):
     user_note: str = ""
 
+
 @app.post("/emails/{email_id}/generate-response")
-def generate_response_endpoint(email_id: str, req: ResponseRequest):
-    """Generate a reply for a given email using Gemini."""
+def generate_response_endpoint(email_id: str, req: ResponseRequest, user_id: int = Depends(current_user)):
+    email = next((item for item in cached_emails(user_id) if item["id"] == email_id), None)
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return {"id": email_id, "response": generate_response(email.get("subject", ""), email.get("body", ""), req.user_note)}
 
-    emails = email_cache.get("summarized", [])
-
-    # If cache is empty, load from saved file
-    if not emails and os.path.exists("summarized_emails.json"):
-        with open("summarized_emails.json", "r", encoding="utf-8") as f:
-            emails = json.load(f)
-
-        email_cache["summarized"] = emails
-
-    for email in emails:
-        if email["id"] == email_id:
-            subject = email.get("subject", "")
-            body = email.get("body", "")
-
-            reply = generate_response(
-                subject,
-                body,
-                req.user_note
-            )
-
-            return {
-                "id": email_id,
-                "response": reply
-            }
-
-    raise HTTPException(status_code=404, detail="Email not found")
 
 class EmailRequest(BaseModel):
     to: str
@@ -219,22 +310,17 @@ class EmailRequest(BaseModel):
 
 
 @app.post("/send_email")
-def send_email_endpoint(req: EmailRequest):
-    try:
-        result = send_email(req.to, req.subject, req.body)
-        return {"status": "sent", "message_id": result["id"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def send_email_endpoint(req: EmailRequest, user_id: int = Depends(current_user)):
+    result = send_email(req.to, req.subject, req.body, load_credentials(user_id))
+    return {"status": "sent", "message_id": result["id"]}
+
 
 class ComposeRequest(BaseModel):
     to: str
     idea: str
 
+
 @app.post("/compose")
-def compose_email(req: ComposeRequest):
-    """Generate a new email from a brief idea."""
-    try:
-        result = generate_new_email(req.to, req.idea)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def compose_email(req: ComposeRequest, user_id: int = Depends(current_user)):
+    load_credentials(user_id)
+    return generate_new_email(req.to, req.idea)

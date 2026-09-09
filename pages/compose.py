@@ -1,7 +1,17 @@
 import streamlit as st
 import requests
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = "https://mail-agent-k3sk.onrender.com"
+
+
+def api_headers():
+    token = st.session_state.get("session_token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+if not st.session_state.get("session_token"):
+    st.link_button("Sign in with Google", f"{API_BASE}/auth/google")
+    st.stop()
 st.set_page_config(page_title="✍️ Compose Email", layout="wide")
 
 st.title("✍️ Compose New Email")
@@ -16,7 +26,7 @@ if generate_clicked:
     else:
         try:
             with st.spinner("Generating email..."):
-                r = requests.post(f"{API_BASE}/compose", json={"to": to_address, "idea": idea}, timeout=30)
+                r = requests.post(f"{API_BASE}/compose", json={"to": to_address, "idea": idea}, headers=api_headers(), timeout=30)
                 r.raise_for_status()
                 result = r.json()
                 st.session_state["compose_subject"] = result.get("subject", "")
@@ -35,7 +45,7 @@ if subject or body:
         else:
             try:
                 payload = {"to": to_address, "subject": subject, "body": body}
-                r = requests.post(f"{API_BASE}/send_email", json=payload, timeout=30)
+                r = requests.post(f"{API_BASE}/send_email", json=payload, headers=api_headers(), timeout=30)
                 r.raise_for_status()
                 st.success("Email sent! ✅")
                 for k in ["compose_subject", "compose_body", "compose_to", "compose_idea"]:

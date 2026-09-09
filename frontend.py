@@ -2,7 +2,6 @@
 import streamlit as st
 import requests
 import html
-from datetime import timedelta
 
 API_BASE = "https://mail-agent-k3sk.onrender.com"
 
@@ -13,6 +12,31 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def api_headers():
+    token = st.session_state.get("session_token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def initialize_auth():
+    st.session_state.setdefault("session_token", None)
+    ticket = st.query_params.get("oauth_ticket")
+    if ticket and not st.session_state["session_token"]:
+        response = requests.post(
+            f"{API_BASE}/auth/exchange", json={"ticket": ticket}, timeout=30
+        )
+        response.raise_for_status()
+        st.session_state["session_token"] = response.json()["session_token"]
+        st.query_params.clear()
+
+
+initialize_auth()
+if not st.session_state.get("session_token"):
+    st.title("AI Mail Agent")
+    st.write("Connect your Google account to access your Gmail.")
+    st.link_button("Sign in with Google", f"{API_BASE}/auth/google")
+    st.stop()
 
 # ---------- Professional UI ----------
 st.markdown("""
@@ -301,14 +325,18 @@ def send_reply_callback(selected_id, to_addr, subject):
 
 # ---------- API helpers ----------
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_emails():
-    r = requests.get(f"{API_BASE}/emails", timeout=30)
+def fetch_emails(session_token):
+    r = requests.get(
+        f"{API_BASE}/emails",
+        headers={"Authorization": f"Bearer {session_token}"},
+        timeout=30,
+    )
     r.raise_for_status()
     return r.json()
 
 
 def fetch_email(email_id: str):
-    r = requests.get(f"{API_BASE}/emails/{email_id}", timeout=30)
+    r = requests.get(f"{API_BASE}/emails/{email_id}", headers=api_headers(), timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -318,6 +346,7 @@ def generate_reply(email_id: str, user_note: str):
     r = requests.post(
         f"{API_BASE}/emails/{email_id}/generate-response",
         json=payload,
+        headers=api_headers(),
         timeout=60,
     )
     r.raise_for_status()
@@ -329,6 +358,7 @@ def send_email(to: str, subject: str, body: str):
     r = requests.post(
         f"{API_BASE}/send_email",
         json=payload,
+        headers=api_headers(),
         timeout=30,
     )
     r.raise_for_status()
@@ -340,6 +370,7 @@ def compose_email(to: str, idea: str):
     r = requests.post(
         f"{API_BASE}/compose",
         json=payload,
+        headers=api_headers(),
         timeout=60,
     )
     r.raise_for_status()
@@ -347,7 +378,7 @@ def compose_email(to: str, idea: str):
 
 
 def refresh_emails():
-    r = requests.post(f"{API_BASE}/refresh", timeout=120)
+    r = requests.post(f"{API_BASE}/refresh", headers=api_headers(), timeout=120)
     r.raise_for_status()
     fetch_emails.clear()
     return r.json()
@@ -483,7 +514,7 @@ else:
     )
 
     try:
-        emails = fetch_emails()
+        emails = fetch_emails(st.session_state["session_token"])
         emails = emails if isinstance(emails, list) else []
     except Exception as e:
         st.error(f"Failed to load emails: {e}")

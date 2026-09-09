@@ -1,4 +1,3 @@
-import json
 import os
 from dotenv import load_dotenv
 from google import genai
@@ -36,25 +35,3 @@ def summarize_with_llm(body: str) -> str:
         return (response.text or "").strip()
     except Exception as e:
         return f"[Gemini Error: {e}]"
-
-if __name__ == "__main__":
-    # Load from raw_emails.json
-    with open("raw_emails.json", "r", encoding="utf-8") as f:
-        raw_emails = json.load(f)
-
-    structured_emails = []
-    for email in raw_emails:
-        summary = summarize_with_llm(email["body"])
-        structured_emails.append({
-            "id": email["id"],
-            "to": email["from"],
-            "subject": email["subject"],
-            "body": email["body"],
-            "summary": summary
-        })
-
-    # Save to summarized_emails.json
-    with open("summarized_emails.json", "w", encoding="utf-8") as f:
-        json.dump(structured_emails, f, indent=2, ensure_ascii=False)
-
-    print(f"✅ Summarized {len(structured_emails)} emails with Gemini and saved to summarized_emails.json")
