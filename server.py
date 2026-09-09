@@ -1,13 +1,25 @@
 import json
 import os
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+from google_auth_oauthlib.flow import Flow
 from pydantic import BaseModel
 from raw_mail import retrieve_emails  # Your Gmail fetcher
 from llm import summarize_with_llm    # Your summarizer
 from send_email import send_email     # Your sender
 from response import generate_response  
 from compose import generate_new_email
+
+GOOGLE_CLIENT_SECRETS = "credentials.json"
+
+GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify"
+]
 
 
 # In-memory cache and API usage tracking
@@ -29,54 +41,74 @@ def track_api_call(call_type: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan context: runs once when the app starts, and cleans up on shutdown.
+    Runs when the FastAPI app starts and shuts down.
+    Gmail access happens only after the user authenticates.
     """
-    print("📩 Fetching emails from Gmail...")
+    print("📩 Mail Agent API started")
 
-    # Step 1: Fetch raw emails
-    retrieve_emails()
+    yield
 
-    # Step 2: Load raw_emails.json
-    if not os.path.exists("raw_emails.json"):
-        print("⚠️ No raw_emails.json found after fetching. Skipping summarization.")
-        yield
-        return
-
-    with open("raw_emails.json", "r", encoding="utf-8") as f:
-        emails = json.load(f)
-
-    summarized = []
-
-    # Step 3: Summarize each email body
-    print("📝 Summarizing emails...")
-    for email in emails:
-        body = email.get("body", "")
-        summary = summarize_with_llm(body)
-        summarized.append({
-            "id": email.get("id"),
-            "from": email.get("from"),
-            "subject": email.get("subject"),
-            "body": body,
-            "summary": summary
-        })
-
-    # Step 4: Save to summarized_emails.json
-    with open("summarized_emails.json", "w", encoding="utf-8") as f:
-        json.dump(summarized, f, indent=4, ensure_ascii=False)
-
-    # Store in memory for faster access
-    email_cache["summarized"] = summarized
-
-    print(f"✅ Summarized {len(summarized)} emails and saved to summarized_emails.json")
-
-    yield  # App runs here
-
-    # Cleanup step (when shutting down)
     email_cache.clear()
     print("🧹 Cleared email cache on shutdown")
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key="change-this-later"
+)
+
+@app.get("/auth/google")
+async def google_login(request: Request):
+    flow = Flow.from_client_secrets_file(
+        GOOGLE_CLIENT_SECRETS,
+        scopes=GOOGLE_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI
+    )
+
+    authorization_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"
+    )
+
+    request.session["oauth_state"] = state
+
+    return RedirectResponse(authorization_url)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request):
+    state = request.session.get("oauth_state")
+
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state missing"
+        )
+
+    flow = Flow.from_client_secrets_file(
+        GOOGLE_CLIENT_SECRETS,
+        scopes=GOOGLE_SCOPES,
+        state=state,
+        redirect_uri=GOOGLE_REDIRECT_URI
+    )
+
+    flow.fetch_token(
+        authorization_response=str(request.url)
+    )
+
+    credentials = flow.credentials
+
+    with open("token.json", "w", encoding="utf-8") as token:
+        token.write(credentials.to_json())
+
+    request.session.pop("oauth_state", None)
+
+    return {
+        "message": "Google account connected successfully!"
+    }
 
 
 @app.post("/refresh")
@@ -142,13 +174,31 @@ class ResponseRequest(BaseModel):
 @app.post("/emails/{email_id}/generate-response")
 def generate_response_endpoint(email_id: str, req: ResponseRequest):
     """Generate a reply for a given email using Gemini."""
+
     emails = email_cache.get("summarized", [])
+
+    # If cache is empty, load from saved file
+    if not emails and os.path.exists("summarized_emails.json"):
+        with open("summarized_emails.json", "r", encoding="utf-8") as f:
+            emails = json.load(f)
+
+        email_cache["summarized"] = emails
+
     for email in emails:
         if email["id"] == email_id:
             subject = email.get("subject", "")
             body = email.get("body", "")
-            reply = generate_response(subject, body, req.user_note)  # Include user's instructions
-            return {"id": email_id, "response": reply}
+
+            reply = generate_response(
+                subject,
+                body,
+                req.user_note
+            )
+
+            return {
+                "id": email_id,
+                "response": reply
+            }
 
     raise HTTPException(status_code=404, detail="Email not found")
 
