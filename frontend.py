@@ -22,12 +22,14 @@ def api_headers():
 def initialize_auth():
     st.session_state.setdefault("session_token", None)
     ticket = st.query_params.get("oauth_ticket")
-    if ticket and not st.session_state["session_token"]:
+    if ticket:
         response = requests.post(
             f"{API_BASE}/auth/exchange", json={"ticket": ticket}, timeout=30
         )
         response.raise_for_status()
         st.session_state["session_token"] = response.json()["session_token"]
+        for key in ("selected_email", "drafts", "compose_result", "show_compose"):
+            st.session_state.pop(key, None)
         st.query_params.clear()
 
 

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from google.auth.transport.requests import Request as GoogleRequest
@@ -22,6 +23,10 @@ from raw_mail import retrieve_emails
 from response import generate_response
 from send_email import send_email
 
+# Render supplies environment variables directly.  Loading a local .env as well
+# keeps the documented local-development setup working without overriding Render.
+load_dotenv()
+
 GOOGLE_CLIENT_SECRETS = "credentials.json"
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
@@ -30,6 +35,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 FERNET_KEY = os.getenv("OAUTH_ENCRYPTION_KEY")
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
+OAUTH_BROWSER_SESSION_TTL_SECONDS = 10 * 60
 
 if not GOOGLE_REDIRECT_URI:
     raise RuntimeError("GOOGLE_REDIRECT_URI is required")
@@ -93,6 +99,7 @@ app.add_middleware(
     secret_key=SESSION_SECRET,
     same_site="lax",
     https_only=os.getenv("COOKIE_SECURE", "true").lower() == "true",
+    max_age=OAUTH_BROWSER_SESSION_TTL_SECONDS,
 )
 
 
