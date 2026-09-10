@@ -59,7 +59,7 @@ Create a `.env` file in the project root with:
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-2.5-flash
 DATABASE_URL=postgresql://user:password@host:5432/database
-GOOGLE_REDIRECT_URI=https://mail-agent-k3sk.onrender.com/auth/google/callback
+GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
 FRONTEND_URL=http://localhost:8501
 SESSION_SECRET=generate-a-long-random-value
 OAUTH_ENCRYPTION_KEY=generate-with-fernet

@@ -1,7 +1,11 @@
-import streamlit as st
-import requests
+import os
 
-API_BASE = "https://mail-agent-k3sk.onrender.com"
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 
 def api_headers():

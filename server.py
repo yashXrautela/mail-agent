@@ -33,7 +33,12 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
 DATABASE_URL = os.getenv("DATABASE_URL")
 SESSION_SECRET = os.getenv("SESSION_SECRET")
 FERNET_KEY = os.getenv("OAUTH_ENCRYPTION_KEY")
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+if GOOGLE_REDIRECT_URI and GOOGLE_REDIRECT_URI.startswith("http://localhost"):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
+]
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 OAUTH_BROWSER_SESSION_TTL_SECONDS = 10 * 60
 
@@ -71,6 +76,11 @@ def init_database():
             CREATE TABLE IF NOT EXISTS oauth_login_tickets (
                 ticket_hash TEXT PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS oauth_pending_requests (
+                state_hash TEXT PRIMARY KEY,
+                code_verifier TEXT NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL
             );
             CREATE TABLE IF NOT EXISTS app_sessions (
@@ -129,6 +139,21 @@ def load_credentials(user_id: int) -> Credentials:
     return credentials
 
 
+def gmail_sender_name(credentials: Credentials) -> str:
+    """Return the display name for the signed-in account's default sender."""
+    try:
+        service = build("gmail", "v1", credentials=credentials)
+        senders = service.users().settings().sendAs().list(userId="me").execute()
+        identities = senders.get("sendAs", [])
+        default_identity = next(
+            (identity for identity in identities if identity.get("isDefault")),
+            identities[0] if identities else {},
+        )
+        return (default_identity.get("displayName") or "").strip()
+    except Exception:
+        return ""
+
+
 def current_user(request: Request) -> int:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
@@ -167,20 +192,38 @@ async def google_login(request: Request):
         scopes=GOOGLE_SCOPES,
         redirect_uri=GOOGLE_REDIRECT_URI,
     )
+    flow.code_verifier = secrets.token_urlsafe(64)
     authorization_url, state = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", prompt="consent"
     )
-    request.session["oauth_state"] = state
-    request.session["code_verifier"] = flow.code_verifier
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO oauth_pending_requests (state_hash, code_verifier, expires_at)
+            VALUES (%s, %s, NOW() + INTERVAL '10 minutes')
+            """,
+            (hash_token(state), flow.code_verifier),
+        )
     return RedirectResponse(authorization_url)
 
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
-    state = request.session.pop("oauth_state", None)
-    code_verifier = request.session.pop("code_verifier", None)
-    if not state or not code_verifier:
+    state = request.query_params.get("state")
+    if not state:
         raise HTTPException(status_code=400, detail="OAuth session is missing or expired")
+    with db() as conn:
+        pending = conn.execute(
+            """
+            DELETE FROM oauth_pending_requests
+            WHERE state_hash = %s AND expires_at > NOW()
+            RETURNING code_verifier
+            """,
+            (hash_token(state),),
+        ).fetchone()
+    if not pending:
+        raise HTTPException(status_code=400, detail="OAuth session is missing or expired")
+    code_verifier = pending[0]
 
     flow = Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRETS,
@@ -307,7 +350,9 @@ def generate_response_endpoint(email_id: str, req: ResponseRequest, user_id: int
     email = next((item for item in cached_emails(user_id) if item["id"] == email_id), None)
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
-    return {"id": email_id, "response": generate_response(email.get("subject", ""), email.get("body", ""), req.user_note)}
+    credentials = load_credentials(user_id)
+    sender_name = gmail_sender_name(credentials)
+    return {"id": email_id, "response": generate_response(email.get("subject", ""), email.get("body", ""), req.user_note, sender_name)}
 
 
 class EmailRequest(BaseModel):
@@ -329,5 +374,6 @@ class ComposeRequest(BaseModel):
 
 @app.post("/compose")
 def compose_email(req: ComposeRequest, user_id: int = Depends(current_user)):
-    load_credentials(user_id)
-    return generate_new_email(req.to, req.idea)
+    credentials = load_credentials(user_id)
+    sender_name = gmail_sender_name(credentials)
+    return generate_new_email(req.to, req.idea, sender_name)

@@ -14,7 +14,9 @@ if not API_KEY:
 # Init Gemini client
 client = genai.Client(api_key=API_KEY)
 
-def generate_response(subject: str, body: str, user_note: str = "") -> str:
+def generate_response(
+    subject: str, body: str, user_note: str = "", sender_name: str = ""
+) -> str:
     """
     Generate a polite, professional email reply with optional user instructions.
     
@@ -23,11 +25,16 @@ def generate_response(subject: str, body: str, user_note: str = "") -> str:
         body: Email body
         user_note: Additional instructions from the user
     """
+    sender_name = sender_name.strip()
+    sender_details = (
+        f"The sender's name is {sender_name}. Use it when appropriate."
+        if sender_name
+        else "Do not assume or invent the sender's name."
+    )
     prompt = f"""
 You are an AI email assistant. Write a short, polite, professional reply to the following email.
 
-Use my details if needed:
-Name : Yash Rautela
+{sender_details}
 
 Subject: {subject}
 Body:

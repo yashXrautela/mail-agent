@@ -1,9 +1,14 @@
 
+import os
+
 import streamlit as st
 import requests
 import html
+from dotenv import load_dotenv
 
-API_BASE = "https://mail-agent-k3sk.onrender.com"
+load_dotenv()
+
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 
 # ---------- Page setup ----------
 st.set_page_config(

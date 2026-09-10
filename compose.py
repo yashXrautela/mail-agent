@@ -14,7 +14,7 @@ if not API_KEY:
 # Init Gemini client
 client = genai.Client(api_key=API_KEY)
 
-def generate_new_email(to: str, idea: str) -> dict:
+def generate_new_email(to: str, idea: str, sender_name: str = "") -> dict:
     """
     Generate a new email from a brief idea.
     
@@ -25,6 +25,12 @@ def generate_new_email(to: str, idea: str) -> dict:
     Returns:
         dict with subject and body
     """
+    sender_name = sender_name.strip()
+    sender_details = (
+        f"The sender's name is {sender_name}. Use it when appropriate."
+        if sender_name
+        else "Do not assume or invent the sender's name."
+    )
     prompt = f"""
 You are an AI email assistant. Generate a professional email based on the following idea.
 Write both a subject line and the email body.
@@ -32,8 +38,7 @@ Write both a subject line and the email body.
 The email should be sent to: {to}
 Email idea/topic: {idea}
 
-Use my details if needed:
-Name: Yash Rautela
+{sender_details}
 
 Format your response exactly like this:
 SUBJECT: [Your generated subject line]
